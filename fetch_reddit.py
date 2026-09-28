@@ -2,24 +2,35 @@
 """
 Daily Reddit Digest
 -------------------
-Fetches the top N posts of the day from a list of subreddits (using
-Reddit's own API, not scraping) and renders them into one static HTML page.
+Fetches the top N posts of the day from a list of subreddits and renders
+them into one static HTML page.
+
+Two modes, chosen automatically:
+  - API mode: if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET are set, uses
+    Reddit's official API (includes scores and comment counts).
+  - RSS mode: otherwise, uses Reddit's public RSS feeds. No credentials
+    needed, but feeds carry no scores or comment counts, and Reddit may
+    block requests from cloud servers (see README).
 
 Meant to be run once a day by the accompanying GitHub Actions workflow,
 but you can also run it locally:
 
-    export REDDIT_CLIENT_ID=xxxx
+    python fetch_reddit.py                      # RSS mode
+    export REDDIT_CLIENT_ID=xxxx                # optional: API mode
     export REDDIT_CLIENT_SECRET=xxxx
     python fetch_reddit.py
 
-See README.md for how to get REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET.
+See README.md for details.
 """
 
 import os
 import sys
+import re
 import html
 import base64
 import json
+import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
@@ -68,12 +79,22 @@ def fetch_top_posts(subreddit: str, token: str, limit: int, window: str) -> list
     req = urlrequest.Request(url)
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("User-Agent", USER_AGENT)
-    try:
-        with urlrequest.urlopen(req, timeout=15) as resp:
-            payload = json.loads(resp.read().decode())
-    except (HTTPError, URLError) as e:
-        print(f"  ! failed to fetch r/{subreddit}: {e}", file=sys.stderr)
-        return []
+    payload = None
+    for attempt in range(2):
+        try:
+            with urlrequest.urlopen(req, timeout=15) as resp:
+                payload = json.loads(resp.read().decode())
+            break
+        except HTTPError as e:
+            if e.code == 429 and attempt == 0:
+                print(f"  ! rate limited on r/{subreddit}, waiting 30s...", file=sys.stderr)
+                time.sleep(30)
+                continue
+            print(f"  ! failed to fetch r/{subreddit}: {e}", file=sys.stderr)
+            return []
+        except URLError as e:
+            print(f"  ! failed to fetch r/{subreddit}: {e}", file=sys.stderr)
+            return []
 
     posts = []
     for child in payload.get("data", {}).get("children", []):
@@ -91,6 +112,57 @@ def fetch_top_posts(subreddit: str, token: str, limit: int, window: str) -> list
     return posts
 
 
+ATOM = "{http://www.w3.org/2005/Atom}"
+
+
+def fetch_top_posts_rss(subreddit: str, limit: int, window: str) -> list:
+    """Credential-free mode: reads Reddit's public Atom feed for the subreddit.
+    Feeds carry no score / comment count / flair, so those are left as None."""
+    url = f"https://www.reddit.com/r/{subreddit}/top/.rss?t={window}&limit={limit}"
+    req = urlrequest.Request(url)
+    req.add_header("User-Agent", USER_AGENT)
+    body = None
+    for attempt in range(2):
+        try:
+            with urlrequest.urlopen(req, timeout=20) as resp:
+                body = resp.read()
+            break
+        except HTTPError as e:
+            if e.code == 429 and attempt == 0:
+                print(f"  ! rate limited on r/{subreddit}, waiting 30s...", file=sys.stderr)
+                time.sleep(30)
+                continue
+            hint = " (Reddit is blocking this machine; see README)" if e.code in (403, 429) else ""
+            print(f"  ! failed to fetch r/{subreddit}: {e}{hint}", file=sys.stderr)
+            return []
+        except URLError as e:
+            print(f"  ! failed to fetch r/{subreddit}: {e}", file=sys.stderr)
+            return []
+
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError as e:
+        print(f"  ! r/{subreddit} returned something that isn't a feed: {e}", file=sys.stderr)
+        return []
+
+    posts = []
+    for entry in root.findall(f"{ATOM}entry")[:limit]:
+        link_el = entry.find(f"{ATOM}link")
+        discussion = link_el.get("href", "") if link_el is not None else ""
+        content = entry.findtext(f"{ATOM}content") or ""
+        m = re.search(r'<a href="([^"]+)">\[link\]</a>', content)
+        author = (entry.findtext(f"{ATOM}author/{ATOM}name") or "unknown").strip()
+        posts.append({
+            "title": (entry.findtext(f"{ATOM}title") or "(untitled)").strip(),
+            "discussion_url": discussion,
+            "external_url": html.unescape(m.group(1)) if m else discussion,
+            "score": None,
+            "num_comments": None,
+            "author": author[3:] if author.startswith("/u/") else author,
+            "flair": None,
+        })
+    return posts
+
 def esc(value) -> str:
     return html.escape(str(value), quote=True)
 
@@ -102,12 +174,20 @@ def render_section(subreddit: str, posts: list) -> str:
         rows = []
         for i, p in enumerate(posts, start=1):
             flair_html = f'<span class="flair">{esc(p["flair"])}</span>' if p["flair"] else ""
+            meta_parts = []
+            if p["score"] is not None:
+                meta_parts.append(f"{p['score']:,} points")
+            if p["num_comments"] is not None:
+                meta_parts.append(f"{p['num_comments']:,} comments")
+            meta_parts.append(f"u/{esc(p['author'])}")
+            meta_parts.append(f'<a href="{esc(p["discussion_url"])}" target="_blank" rel="noopener">view thread</a>')
+            meta_html = " &middot; ".join(meta_parts)
             rows.append(f"""
         <li class="post">
           <span class="rank">{i:02d}</span>
           <div class="post-body">
             <a class="title" href="{esc(p['external_url'])}" target="_blank" rel="noopener">{esc(p['title'])}</a>{flair_html}
-            <div class="meta">{p['score']:,} points &middot; {p['num_comments']:,} comments &middot; u/{esc(p['author'])} &middot; <a href="{esc(p['discussion_url'])}" target="_blank" rel="noopener">view thread</a></div>
+            <div class="meta">{meta_html}</div>
           </div>
         </li>""")
         items = "".join(rows)
@@ -270,21 +350,27 @@ def render_html(data: dict, generated_at: str) -> str:
 def main():
     client_id = os.environ.get("REDDIT_CLIENT_ID")
     client_secret = os.environ.get("REDDIT_CLIENT_SECRET")
-    if not client_id or not client_secret:
-        print(
-            "Missing REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET environment variables.\n"
-            "See README.md for how to create these.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    use_api = bool(client_id and client_secret)
 
-    print("Authenticating with Reddit...")
-    token = get_access_token(client_id, client_secret)
+    token = None
+    if use_api:
+        print("Using Reddit API (credentials found). Authenticating...")
+        token = get_access_token(client_id, client_secret)
+    else:
+        print("No API credentials found; using public RSS feeds.")
 
     data = {}
     for sub in SUBREDDITS:
         print(f"Fetching r/{sub} ...")
-        data[sub] = fetch_top_posts(sub, token, POSTS_PER_SUBREDDIT, TIME_WINDOW)
+        if use_api:
+            data[sub] = fetch_top_posts(sub, token, POSTS_PER_SUBREDDIT, TIME_WINDOW)
+        else:
+            data[sub] = fetch_top_posts_rss(sub, POSTS_PER_SUBREDDIT, TIME_WINDOW)
+        time.sleep(1)  # stay well under Reddit's rate limit
+
+    if not any(data.values()):
+        print("No posts were fetched from any subreddit; leaving the existing page untouched.", file=sys.stderr)
+        sys.exit(1)
 
     generated_at = datetime.now(timezone.utc).strftime("%B %d, %Y at %H:%M UTC")
     output_html = render_html(data, generated_at)
