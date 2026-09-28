@@ -80,21 +80,21 @@ def fetch_top_posts(subreddit: str, token: str, limit: int, window: str) -> list
     req.add_header("Authorization", f"Bearer {token}")
     req.add_header("User-Agent", USER_AGENT)
     payload = None
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             with urlrequest.urlopen(req, timeout=15) as resp:
                 payload = json.loads(resp.read().decode())
             break
         except HTTPError as e:
-            if e.code == 429 and attempt == 0:
-                print(f"  ! rate limited on r/{subreddit}, waiting 30s...", file=sys.stderr)
-                time.sleep(30)
+            if e.code == 429 and attempt < 2:
+                print(f"  ! rate limited on r/{subreddit}, waiting before retry...", file=sys.stderr)
+                time.sleep(20 * (attempt + 1))
                 continue
             print(f"  ! failed to fetch r/{subreddit}: {e}", file=sys.stderr)
-            return []
+            return None
         except URLError as e:
             print(f"  ! failed to fetch r/{subreddit}: {e}", file=sys.stderr)
-            return []
+            return None
 
     posts = []
     for child in payload.get("data", {}).get("children", []):
@@ -122,28 +122,28 @@ def fetch_top_posts_rss(subreddit: str, limit: int, window: str) -> list:
     req = urlrequest.Request(url)
     req.add_header("User-Agent", USER_AGENT)
     body = None
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             with urlrequest.urlopen(req, timeout=20) as resp:
                 body = resp.read()
             break
         except HTTPError as e:
-            if e.code == 429 and attempt == 0:
-                print(f"  ! rate limited on r/{subreddit}, waiting 30s...", file=sys.stderr)
-                time.sleep(30)
+            if e.code == 429 and attempt < 2:
+                print(f"  ! rate limited on r/{subreddit}, waiting before retry...", file=sys.stderr)
+                time.sleep(20 * (attempt + 1))
                 continue
             hint = " (Reddit is blocking this machine; see README)" if e.code in (403, 429) else ""
             print(f"  ! failed to fetch r/{subreddit}: {e}{hint}", file=sys.stderr)
-            return []
+            return None
         except URLError as e:
             print(f"  ! failed to fetch r/{subreddit}: {e}", file=sys.stderr)
-            return []
+            return None
 
     try:
         root = ET.fromstring(body)
     except ET.ParseError as e:
         print(f"  ! r/{subreddit} returned something that isn't a feed: {e}", file=sys.stderr)
-        return []
+        return None
 
     posts = []
     for entry in root.findall(f"{ATOM}entry")[:limit]:
@@ -168,8 +168,10 @@ def esc(value) -> str:
 
 
 def render_section(subreddit: str, posts: list) -> str:
-    if not posts:
-        items = '<li class="empty">No posts fetched for this subreddit today.</li>'
+    if posts is None:
+        items = '<li class="empty">Couldn\'t load this subreddit on the last run.</li>'
+    elif not posts:
+        items = '<li class="empty">No posts in the last 24 hours.</li>'
     else:
         rows = []
         for i, p in enumerate(posts, start=1):
@@ -366,7 +368,9 @@ def main():
             data[sub] = fetch_top_posts(sub, token, POSTS_PER_SUBREDDIT, TIME_WINDOW)
         else:
             data[sub] = fetch_top_posts_rss(sub, POSTS_PER_SUBREDDIT, TIME_WINDOW)
-        time.sleep(1)  # stay well under Reddit's rate limit
+        result = data[sub]
+        print(f"  -> {'FAILED' if result is None else str(len(result)) + ' posts'}")
+        time.sleep(2)  # stay well under Reddit's rate limit
 
     if not any(data.values()):
         print("No posts were fetched from any subreddit; leaving the existing page untouched.", file=sys.stderr)
