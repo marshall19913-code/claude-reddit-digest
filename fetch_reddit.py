@@ -31,7 +31,7 @@ import base64
 import json
 import time
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 
@@ -97,8 +97,11 @@ SUBREDDITS = [
     "technology",
 ]
 
-POSTS_PER_SUBREDDIT = 10
-TIME_WINDOW = "day"          # one of: day, week, month, year, all
+POSTS_PER_SUBREDDIT = 10     # max NEW posts shown per subreddit
+FETCH_LIMIT = 25             # how many of the week's top posts to look through
+TIME_WINDOW = "week"         # one of: day, week, month, year, all
+SEEN_PATH = "seen_posts.json"  # remembers what you've already been shown
+SEEN_KEEP_DAYS = 14          # forget posts after this long (must exceed the window)
 OUTPUT_PATH = "docs/index.html"
 PAGE_TITLE = "The Daily Sift"
 
@@ -152,6 +155,7 @@ def fetch_top_posts(subreddit: str, token: str, limit: int, window: str) -> list
         p = child.get("data", {})
         permalink = f"https://reddit.com{p.get('permalink', '')}"
         posts.append({
+            "id": p.get("name") or permalink,
             "title": p.get("title", "(untitled)"),
             "discussion_url": permalink,
             "external_url": p.get("url_overridden_by_dest") or permalink,
@@ -204,6 +208,7 @@ def fetch_top_posts_rss(subreddit: str, limit: int, window: str) -> list:
         m = re.search(r'<a href="([^"]+)">\[link\]</a>', content)
         author = (entry.findtext(f"{ATOM}author/{ATOM}name") or "unknown").strip()
         posts.append({
+            "id": (entry.findtext(f"{ATOM}id") or discussion).strip(),
             "title": (entry.findtext(f"{ATOM}title") or "(untitled)").strip(),
             "discussion_url": discussion,
             "external_url": html.unescape(m.group(1)) if m else discussion,
@@ -222,7 +227,7 @@ def render_section(subreddit: str, posts: list) -> str:
     if posts is None:
         items = '<li class="empty">Couldn\'t load this subreddit on the last run.</li>'
     elif not posts:
-        items = '<li class="empty">No posts in the last 24 hours.</li>'
+        items = '<li class="empty">No new posts since the last run.</li>'
     else:
         rows = []
         for i, p in enumerate(posts, start=1):
@@ -375,7 +380,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <body>
   <header class="masthead">
     <h1>__PAGE_TITLE__</h1>
-    <p>Top posts of the day, across __SUBREDDIT_COUNT__ subreddits &middot; generated __GENERATED_AT__</p>
+    <p>New posts gaining traction, across __SUBREDDIT_COUNT__ subreddits &middot; generated __GENERATED_AT__</p>
   </header>
 
   <main>__SECTIONS__
@@ -400,6 +405,14 @@ def render_html(data: dict, generated_at: str) -> str:
     )
 
 
+def load_seen() -> dict:
+    try:
+        with open(SEEN_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
 def main():
     client_id = os.environ.get("REDDIT_CLIENT_ID")
     client_secret = os.environ.get("REDDIT_CLIENT_SECRET")
@@ -416,9 +429,9 @@ def main():
     for sub in SUBREDDITS:
         print(f"Fetching r/{sub} ...")
         if use_api:
-            data[sub] = fetch_top_posts(sub, token, POSTS_PER_SUBREDDIT, TIME_WINDOW)
+            data[sub] = fetch_top_posts(sub, token, FETCH_LIMIT, TIME_WINDOW)
         else:
-            data[sub] = fetch_top_posts_rss(sub, POSTS_PER_SUBREDDIT, TIME_WINDOW)
+            data[sub] = fetch_top_posts_rss(sub, FETCH_LIMIT, TIME_WINDOW)
         result = data[sub]
         print(f"  -> {'FAILED' if result is None else str(len(result)) + ' posts'}")
         time.sleep(2)  # stay well under Reddit's rate limit
@@ -427,6 +440,21 @@ def main():
         print("No posts were fetched from any subreddit; leaving the existing page untouched.", file=sys.stderr)
         sys.exit(1)
 
+    # Keep only posts not shown on an earlier day. Posts first shown *today*
+    # still count as new, so re-running the workflow the same day is harmless.
+    today = datetime.now(timezone.utc).date()
+    today_s = today.isoformat()
+    seen = load_seen()
+    for sub in list(data):
+        if data[sub] is None:
+            continue  # failed fetch: don't mark anything as seen
+        fresh = [p for p in data[sub] if p["id"] not in seen or seen[p["id"]] == today_s]
+        fresh = fresh[:POSTS_PER_SUBREDDIT]
+        for p in fresh:
+            seen.setdefault(p["id"], today_s)
+        data[sub] = fresh
+        print(f"r/{sub}: {len(fresh)} new")
+
     generated_at = datetime.now(timezone.utc).strftime("%B %d, %Y at %H:%M UTC")
     output_html = render_html(data, generated_at)
 
@@ -434,6 +462,12 @@ def main():
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         f.write(output_html)
     print(f"Wrote {OUTPUT_PATH}")
+
+    cutoff = (today - timedelta(days=SEEN_KEEP_DAYS)).isoformat()
+    seen = {k: v for k, v in seen.items() if v >= cutoff}
+    with open(SEEN_PATH, "w", encoding="utf-8") as f:
+        json.dump(seen, f, indent=0, sort_keys=True)
+    print(f"Saved {len(seen)} remembered posts to {SEEN_PATH}")
 
 
 if __name__ == "__main__":
