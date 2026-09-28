@@ -52,7 +52,7 @@ OUTPUT_PATH = "docs/index.html"
 PAGE_TITLE = "The Daily Sift"
 
 # Reddit requires a descriptive, unique user agent — put your username in it.
-USER_AGENT = "daily-reddit-digest/1.0 (by u/Unique-Highlight-241)"
+USER_AGENT = "daily-reddit-digest/1.0 (by u/your_username)"
 # ---------------------------------------------------------------------------
 
 REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
