@@ -1,11 +1,9 @@
 name: Daily Reddit Digest
 
 on:
-  schedule:
-    # 12:00 UTC every day — edit this to shift the time.
-    # (crontab.guru is handy if you want to work out your local-time equivalent)
-    - cron: "0 12 * * *"
-  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+  # No automatic schedule. Trigger a run manually from the repo's
+  # Actions tab whenever you want a fresh page.
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -32,6 +30,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/index.html
+          git add docs/index.html seen_posts.json
           git diff --quiet --cached || git commit -m "Update daily digest ($(date -u +'%Y-%m-%d'))"
           git push
