@@ -97,8 +97,8 @@ SUBREDDITS = [
     "technology",
 ]
 
-POSTS_PER_SUBREDDIT = 10     # max NEW posts shown per subreddit
-FETCH_LIMIT = 25             # how many of the week's top posts to look through
+POSTS_PER_SUBREDDIT = 5      # max NEW posts shown per subreddit
+FETCH_LIMIT = 35             # how many of the week's top posts to look through
 TIME_WINDOW = "week"         # one of: day, week, month, year, all
 SEEN_PATH = "seen_posts.json"  # remembers what you've already been shown
 SEEN_KEEP_DAYS = 14          # forget posts after this long (must exceed the window)
@@ -448,12 +448,17 @@ def main():
     for sub in list(data):
         if data[sub] is None:
             continue  # failed fetch: don't mark anything as seen
-        fresh = [p for p in data[sub] if p["id"] not in seen or seen[p["id"]] == today_s]
-        fresh = fresh[:POSTS_PER_SUBREDDIT]
-        for p in fresh:
+        fetched = data[sub]  # this run's ranked top-35, most likely first
+        fresh = [p for p in fetched if p["id"] not in seen or seen[p["id"]] == today_s]
+        shown = fresh[:POSTS_PER_SUBREDDIT]
+        # Mark only what's actually shown. Anything ranked lower stays
+        # eligible, so a post that climbs into the top 5 later still gets
+        # its turn -- that's what lets late bloomers surface once they
+        # prove themselves, at the cost of them not looking "brand new."
+        for p in shown:
             seen.setdefault(p["id"], today_s)
-        data[sub] = fresh
-        print(f"r/{sub}: {len(fresh)} new")
+        data[sub] = shown
+        print(f"r/{sub}: {len(shown)} new")
 
     generated_at = datetime.now(timezone.utc).strftime("%B %d, %Y at %H:%M UTC")
     output_html = render_html(data, generated_at)
